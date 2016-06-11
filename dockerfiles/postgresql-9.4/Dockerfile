@@ -1,71 +1,68 @@
+####################
+# 1. build : docker build -t edb:{version} .; 
+# 2. run : docker run -itd -p 5432:5432 --name=edb -v /data/edb/dbdata:/data/edb/dbdata {image name} 
+###################
 FROM centos:centos6.6
-MAINTAINER codehumane@gmail.com
-
-ARG POSTGRESQL_USER=jenkins
-ARG POSTGRESQL_PASSWORD=jenkins
-ARG POSTGRESQL_DATABASE=jenkins
-
-RUN echo "root:root" | chpasswd
-RUN yum -y install wget tar
+MAINTAINER codehumane
 
 
-# ssh install
-RUN yum install -y openssh-server openssh-clients && \
-       sed -ri 's/session    required     pam_loginuid.so/session    optional     pam_loginuid.so/g' /etc/pam.d/sshd && \
-       mkdir -p /var/run/sshd && \
-       ssh-keygen -t rsa -f /etc/ssh/ssh_host_rsa_key -N '' && \
-       ssh-keygen -t dsa -f /etc/ssh/ssh_host_dsa_key -N ''
+# user
+ENV USER mailadm
+RUN groupadd -g 500 $USER \
+        && useradd -g 500 -u 500 -d /home/$USER $USER \
+        && echo "root:thwnekfrehflxkd!" | chpasswd \
+        && echo "$USER:$USER" | chpasswd
 
+# environment
+ENV DB_USER mailadm
+ENV DB_PASSWORD pgadmin80!@
+ENV DB_NAME tims
+ENV DB_PORT 5432
+ENV BASE_DIR /data
+ENV EDB_DIR $BASE_DIR/edb
+ENV LOG_DIR $BASE_DIR/log/postgresql
+ENV INSTALL_DIR $BASE_DIR/install
+ENV BIN_DIR $EDB_DIR/9.4AS/bin
+ENV DATA_DIR $EDB_DIR/dbdata
+ENV LOCALE ko_KR.UTF-8
 
-# postgresql install & init
-RUN sed -ri 's#\[base\]#[base]\nexclude=postgresql*#g' /etc/yum.repos.d/CentOS-Base.repo && \
-       sed -ri 's#\[updates\]#[updates]\nexclude=postgresql*#g' /etc/yum.repos.d/CentOS-Base.repo && \
-       yum -y localinstall http://yum.postgresql.org/9.4/redhat/rhel-6-x86_64/pgdg-centos94-9.4-1.noarch.rpm && \
-       yum -y install postgresql94-server && \
-       echo "postgres:postgres" | chpasswd
-RUN service postgresql-9.4 initdb
-RUN sed -ri 's/shared_buffers = 32MB/shared_buffers = 1024MB/g' /var/lib/pgsql/9.4/data/postgresql.conf && \
-       sed -ri "s/#listen_addresses = 'localhost'/listen_addresses = '*'/g" /var/lib/pgsql/9.4/data/postgresql.conf && \
-       sed -ri "s#local   all             all                                     peer#local   all             all                                     trust#g" /var/lib/pgsql/9.4/data/pg_hba.conf && \
-       sed -ri "s#host    all             all             127.0.0.1/32            ident#host    all             all             127.0.0.1/32            trust#g" /var/lib/pgsql/9.4/data/pg_hba.conf && \
-       sed -ri "s#host    all             all             ::1/128                 ident#host    all             all             ::1/128                 trust#g" /var/lib/pgsql/9.4/data/pg_hba.conf && \
-       echo "host    all     all     172.16.0.0/12   trust" >> /var/lib/pgsql/9.4/data/pg_hba.conf
+# console login 허용
+RUN echo "session required pam_limits.so" >> /etc/pam.d/login
 
-ENV PGDATA /var/lib/pgsql/9.4/data
-ENV PGSQL_HOME /usr/pgsql-9.4
-ENV PATH $PGSQL_HOME/bin:$PATH
+# locale 설정
+RUN localedef -i ko_KR -f UTF-8 $LOCALE \
+        && localedef -i ko_KR -f EUC-KR ko_KR.euckr \
+        && echo "export LANGUAGE=$LOCALE" >> ~/.bash_profile \
+        && echo "export LANG=$LOCALE" >> ~/.bash_profile \
+        && echo "export LC_CTYPE=$LOCALE" >> ~/.bash_profile \
+        && echo "export LC_ALL=$LOCALE" >> ~/.bash_profile \
+        && touch ~/.bash_profile
 
-USER postgres
-RUN echo "export PGSQL_HOME=/usr/pgsql-9.4" >> ~/.bash_profile && \
-       echo "export PGDATA=/var/lib/pgsql/9.4/data" >>  ~/.bash_profile && \
-       echo "export PATH=$PATH" >> ~/.bash_profile && \
-       source ~/.bash_profile
-RUN pg_ctl start && \
-       sleep 10 && \
-       psql --command "CREATE USER $POSTGRESQL_USER WITH SUPERUSER PASSWORD '$POSTGRESQL_PASSWORD';" && \
-       createdb -O $POSTGRESQL_USER $POSTGRESQL_DATABASE
+# postgresql add
+RUN mkdir -p $LOG_DIR \
+        && mkdir -p $EDB_DIR
+ADD edb/. $EDB_DIR/
+
+# setup file add and set
+RUN mkdir -p $INSTALL_DIR
+ADD setup.sh $INSTALL_DIR/
+RUN chmod +x $INSTALL_DIR/setup.sh
+
+# owner
+RUN chown -R $USER:$USER $BASE_DIR
+
+# env
+ENV PGDATA $DATA_DIR
+ENV PATH $BIN_DIR:$PATH
+USER $USER
+RUN echo "export PGDATA=/data/edb/dbdata" >>  ~/.bash_profile \
+        && echo "export PATH=$PATH" >> ~/.bash_profile \
+        && source ~/.bash_profile
 USER root
 
-
-
-# supervisord
-
-RUN yum -y install python-setuptools && \
-       easy_install supervisor && \
-       echo_supervisord_conf > /etc/supervisord.conf
-
-RUN sed -ri 's/nodaemon=false/nodaemon=true/g' /etc/supervisord.conf && \
-       echo "[program:sshd]" >> /etc/supervisord.conf && \
-       echo "command=/usr/sbin/sshd -D" >> /etc/supervisord.conf && \
-       echo "user=root" >> /etc/supervisord.conf && \
-       echo "[program:postgresql]" >> /etc/supervisord.conf && \
-       echo "command=postgres" >> /etc/supervisord.conf && \
-       echo "user=postgres" >> /etc/supervisord.conf
-
-
-
-# port and cmd
-WORKDIR $PGSQL_HOME
-EXPOSE 22
-EXPOSE 5432
-CMD ["supervisord", "-c", "/etc/supervisord.conf"]
+# run
+USER root
+EXPOSE $DB_PORT
+VOLUME $DATA_DIR
+WORKDIR $EDB_DIR
+CMD ["/bin/sh", "-c", "$INSTALL_DIR/setup.sh; su - $USER -c \"$BIN_DIR/edb-postmaster -D $DATA_DIR\";"]
